@@ -1,0 +1,13 @@
+{
+  "name": "claude-pet",
+  "version": "1.0.0",
+  "description": "A desktop pet that animates while Claude Code is working and alerts you when a session needs approval.",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}
