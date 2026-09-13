@@ -55,8 +55,7 @@ function updateTray() {
   if (!tray) return;
   const state = computeGlobalState();
   const alertCount = [...sessions.values()].filter((s) => s.state === 'alert').length;
-  const icons = { idle: '\u{1F43E}', working: '⚙️', alert: '\u{1F6A8}' };
-  tray.setTitle(icons[state] || icons.idle);
+  tray.setImage(TRAY_ICONS[state] || TRAY_ICONS.idle);
   tray.setToolTip(
     state === 'alert'
       ? `Claude Pet — ${alertCount} session${alertCount === 1 ? '' : 's'} need approval`
@@ -202,14 +201,20 @@ function createWindow() {
   mainWindow.webContents.on('did-finish-load', broadcastState);
 }
 
-// 1x1 transparent PNG — the tray icon is really just the emoji title on macOS;
-// this is only here because Tray requires a non-empty image.
-const BLANK_PNG =
-  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+// Small filled-circle PNGs (32x32 @2x) — one per pet state. A plain colored
+// dot rendered directly as the tray image, rather than relying on an emoji
+// title (which didn't reliably render as a real status item on this setup).
+const TRAY_ICON_DATA = {
+  idle: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAQAAADZc7J/AAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAACYktHRAD/h4/MvwAAAAd0SU1FB+oJDQcEFYiPH4IAAAAldEVYdGRhdGU6Y3JlYXRlADIwMjYtMDktMTNUMDc6MDQ6MjErMDA6MDCeinT1AAAAJXRFWHRkYXRlOm1vZGlmeQAyMDI2LTA5LTEzVDA3OjA0OjIxKzAwOjAw79fMSQAAACh0RVh0ZGF0ZTp0aW1lc3RhbXAAMjAyNi0wOS0xM1QwNzowNDoyMSswMDowMLjC7ZYAAAEPSURBVEjH7ZUxjoMwEEXfpky7ooaWGzgXoLDCGVZKlz0QZaRwBSQXXGC5AW1SW2lTb4GCjbOAp0gT7XTG858+ePyB//qY29ApBXt2JFg6GlpzjQZoxYn86XHPwXSrAL2l4mvWcc3R3BcA+pOeZPGlLbm5zQD0lsuKfEBkzsVmslVFyCGh+tOBVvxEyIfaPT6n7+AULfd6Rwc65SIAQDbMhXNQiORjvwOUQkAZApQQoEJAzAH6lYQAKwTYENAJAU9z0AgBTQhohYA2AJgrvUDeP+LFH+WDADD2egDTUUfKzy6Zptf5GHWYlm+3mADMnXwVYcn9UJs6wNzIOC/IazI/0F6RyiMkpaBErf0X3qB+AX2xR43/yvtLAAAAAElFTkSuQmCC',
+  working: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgBAMAAACBVGfHAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAAqUExURQAAAMJBDMJBDMJBDMJBDMJBDMJBDMJBDMJBDMJBDMJBDMJBDMJBDP///wVdxtwAAAAMdFJOUwAfZbHqsjjWCqChE2RPKioAAAABYktHRA32tGH1AAAAB3RJTUUH6gkNBwQViI8fggAAACV0RVh0ZGF0ZTpjcmVhdGUAMjAyNi0wOS0xM1QwNzowNDoyMSswMDowMJ6KdPUAAAAldEVYdGRhdGU6bW9kaWZ5ADIwMjYtMDktMTNUMDc6MDQ6MjErMDA6MDDv18xJAAAAKHRFWHRkYXRlOnRpbWVzdGFtcAAyMDI2LTA5LTEzVDA3OjA0OjIxKzAwOjAwuMLtlgAAAIRJREFUKM9jYKAaEDI5EiSAxE8/AwTHE+D8zjNgcKoByuf2gQic8YYKtED5Z45AlcyBCZyZAOazwflnjoEF2BECx8ECMgiBM2C36CAJKIAEYpAEAkACPkgCDiABJP6ZA1hVYJiBYQuGOzBciuEXhjVovsUMD4wQwwhTzFAHxksIaryQBAAumb4L9djWGwAAAABJRU5ErkJggg==',
+  alert: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgBAMAAACBVGfHAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAAqUExURQAAANwmJtwmJtwmJtwmJtwmJtwmJtwmJtwmJtwmJtwmJtwmJtwmJv///yBfpdUAAAAMdFJOUwAfZbHqsjjWCqChE2RPKioAAAABYktHRA32tGH1AAAAB3RJTUUH6gkNBwQViI8fggAAACV0RVh0ZGF0ZTpjcmVhdGUAMjAyNi0wOS0xM1QwNzowNDoyMSswMDowMJ6KdPUAAAAldEVYdGRhdGU6bW9kaWZ5ADIwMjYtMDktMTNUMDc6MDQ6MjErMDA6MDDv18xJAAAAKHRFWHRkYXRlOnRpbWVzdGFtcAAyMDI2LTA5LTEzVDA3OjA0OjIxKzAwOjAwuMLtlgAAAIRJREFUKM9jYKAaEDI5EiSAxE8/AwTHE+D8zjNgcKoByuf2gQic8YYKtED5Z45AlcyBCZyZAOazwflnjoEF2BECx8ECMgiBM2C36CAJKIAEYpAEAkACPkgCDiABJP6ZA1hVYJiBYQuGOzBciuEXhjVovsUMD4wQwwhTzFAHxksIaryQBAAumb4L9djWGwAAAABJRU5ErkJggg==',
+};
+const TRAY_ICONS = Object.fromEntries(
+  Object.entries(TRAY_ICON_DATA).map(([k, v]) => [k, nativeImage.createFromDataURL(v)])
+);
 
 function createTray() {
-  const icon = nativeImage.createFromDataURL(BLANK_PNG);
-  tray = new Tray(icon);
+  tray = new Tray(TRAY_ICONS.idle);
   const menu = Menu.buildFromTemplate([
     {
       label: 'Show/Hide Pet',
