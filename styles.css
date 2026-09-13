@@ -18,46 +18,96 @@ body {
 }
 
 #pet {
-  width: 100px;
-  height: 90px;
-  margin: 28px auto 0;
-  background: #d97757;
-  border-radius: 50% 50% 45% 45% / 60% 60% 40% 40%;
-  position: relative;
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
-  transition: background-color 0.35s ease;
+  position: absolute;
+  left: 27px;
+  top: 14px;
+  width: 86px;
+  height: 104px;
+  --block: #d97757;
+  transition: --block 0.3s ease;
+}
+
+@property --block {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: #d97757;
+}
+
+.head,
+.body,
+.arm,
+.leg {
+  position: absolute;
+  background: var(--block);
+  border-radius: 8px;
+  box-shadow: inset 2px 2px 0 rgba(255, 255, 255, 0.28), inset -2px -3px 0 rgba(0, 0, 0, 0.18), 0 3px 6px rgba(0, 0, 0, 0.25);
+}
+
+.head {
+  width: 40px;
+  height: 36px;
+  left: 23px;
+  top: 0;
+  z-index: 3;
+}
+
+.body {
+  width: 54px;
+  height: 46px;
+  left: 16px;
+  top: 34px;
+  z-index: 2;
+}
+
+.arm {
+  width: 13px;
+  height: 32px;
+  top: 38px;
+  border-radius: 6px;
+  z-index: 1;
+}
+.arm.left {
+  left: 1px;
+  transform-origin: top center;
+}
+.arm.right {
+  left: 72px;
+  transform-origin: top center;
+}
+
+.leg {
+  width: 16px;
+  height: 22px;
+  top: 78px;
+  border-radius: 6px;
+  z-index: 1;
+}
+.leg.left {
+  left: 20px;
+}
+.leg.right {
+  left: 50px;
 }
 
 .eye {
-  width: 10px;
-  height: 10px;
-  background: #2b1c14;
-  border-radius: 50%;
   position: absolute;
-  top: 32px;
+  width: 6px;
+  height: 6px;
+  background: #2b1c14;
+  border-radius: 2px;
+  top: 15px;
 }
 .eye.left {
-  left: 28px;
+  left: 10px;
 }
 .eye.right {
-  left: 62px;
-}
-
-.mouth {
-  width: 18px;
-  height: 9px;
-  border-radius: 0 0 18px 18px;
-  background: #2b1c14;
-  position: absolute;
-  top: 50px;
-  left: 41px;
-  opacity: 0.85;
+  left: 24px;
 }
 
 #badge {
   position: absolute;
-  top: 14px;
-  right: 14px;
+  top: 4px;
+  right: 8px;
   min-width: 20px;
   height: 20px;
   padding: 0 4px;
@@ -69,6 +119,7 @@ body {
   justify-content: center;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
   display: none;
+  z-index: 5;
 }
 body.alert #badge.show {
   display: flex;
@@ -90,7 +141,7 @@ body.idle #pet {
 
 /* working */
 body.working #pet {
-  background: #c2410c;
+  --block: #c2410c;
   animation: bounce 0.55s ease-in-out infinite;
 }
 @keyframes bounce {
@@ -99,10 +150,34 @@ body.working #pet {
     transform: translateY(0) scaleX(1);
   }
   30% {
-    transform: translateY(-14px) scaleX(0.94);
+    transform: translateY(-12px) scaleX(0.95);
   }
   60% {
-    transform: translateY(0) scaleX(1.08);
+    transform: translateY(0) scaleX(1.06);
+  }
+}
+body.working .arm.left {
+  animation: swing-left 0.55s ease-in-out infinite;
+}
+body.working .arm.right {
+  animation: swing-right 0.55s ease-in-out infinite;
+}
+@keyframes swing-left {
+  0%,
+  100% {
+    transform: rotate(-10deg);
+  }
+  50% {
+    transform: rotate(20deg);
+  }
+}
+@keyframes swing-right {
+  0%,
+  100% {
+    transform: rotate(10deg);
+  }
+  50% {
+    transform: rotate(-20deg);
   }
 }
 body.working .eye {
@@ -120,9 +195,12 @@ body.working .eye {
 
 /* alert */
 body.alert #pet {
-  background: #dc2626;
+  --block: #dc2626;
   animation: shake 0.35s ease-in-out infinite;
-  box-shadow: 0 0 0 8px rgba(220, 38, 38, 0.35), 0 6px 16px rgba(0, 0, 0, 0.3);
+}
+body.alert .head {
+  box-shadow: inset 2px 2px 0 rgba(255, 255, 255, 0.28), inset -2px -3px 0 rgba(0, 0, 0, 0.18), 0 0 0 6px rgba(220, 38, 38, 0.35),
+    0 3px 6px rgba(0, 0, 0, 0.3);
 }
 @keyframes shake {
   0%,
