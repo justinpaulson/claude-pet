@@ -6,17 +6,59 @@
   </head>
   <body class="idle">
     <div id="pet-wrap">
-      <div id="badge"></div>
-      <div id="pet">
-        <div class="head">
-          <div class="eye left"></div>
-          <div class="eye right"></div>
+      <div id="stack">
+        <div id="pet-clip">
+          <div id="pet">
+            <div id="pet-body">
+              <div class="head">
+                <div class="eye left"></div>
+                <div class="eye right"></div>
+              </div>
+              <div class="arm left"></div>
+              <div class="arm right"></div>
+              <div class="body"></div>
+              <div class="leg left"></div>
+              <div class="leg right"></div>
+            </div>
+            <div id="badge"></div>
+          </div>
         </div>
-        <div class="arm left"></div>
-        <div class="arm right"></div>
-        <div class="body"></div>
-        <div class="leg left"></div>
-        <div class="leg right"></div>
+        <div id="hud">
+          <div class="row">
+            <div class="row-top">
+              <span class="label">STORAGE</span>
+              <span class="pct" id="disk-pct">—</span>
+            </div>
+            <div class="bar"><div class="fill disk" id="disk-fill"></div></div>
+            <div class="detail" id="disk-detail">— / — GB</div>
+          </div>
+          <div class="row">
+            <div class="row-top">
+              <span class="label">MEMORY</span>
+              <span class="pct" id="mem-pct">—</span>
+            </div>
+            <div class="bar"><div class="fill mem" id="mem-fill"></div></div>
+            <div class="detail" id="mem-detail">— / — GB</div>
+          </div>
+          <!-- Claude's own usage windows. Only shown once its status line has
+               reported them; hidden entirely otherwise. -->
+          <div class="row hidden" id="row-session">
+            <div class="row-top">
+              <span class="label">SESSION</span>
+              <span class="pct" id="session-pct">—</span>
+            </div>
+            <div class="bar"><div class="fill session" id="session-fill"></div></div>
+            <div class="detail" id="session-detail">—</div>
+          </div>
+          <div class="row hidden" id="row-weekly">
+            <div class="row-top">
+              <span class="label">WEEKLY</span>
+              <span class="pct" id="week-pct">—</span>
+            </div>
+            <div class="bar"><div class="fill week" id="week-fill"></div></div>
+            <div class="detail" id="week-detail">—</div>
+          </div>
+        </div>
       </div>
     </div>
     <script src="renderer.js"></script>

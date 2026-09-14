@@ -1,8 +1,8 @@
 html,
 body {
   margin: 0;
-  width: 140px;
-  height: 140px;
+  width: 216px;
+  height: 328px;
   background: transparent;
   overflow: hidden;
   -webkit-user-select: none;
@@ -10,21 +10,133 @@ body {
   cursor: default;
 }
 
+/* No -webkit-app-region: drag here — dragging is handled in renderer.js/main.js
+   so that a press without movement can be treated as a click instead. */
 #pet-wrap {
   position: relative;
-  width: 140px;
-  height: 140px;
-  -webkit-app-region: drag;
+  width: 216px;
+  height: 328px;
+  /* Only the card and the pet catch the mouse; the empty space the pet pops up
+     into stays click-through (see the hover tracking in renderer.js). */
+  pointer-events: none;
 }
 
+/* Stacking the clip box directly on top of the card is what ties the two
+   together: the box's bottom edge is the card's top edge whatever height the
+   card ends up being, so that's the line the pet is hidden below. */
+#stack {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  width: 200px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Rather than relying on the card being opaque enough to cover him (it isn't —
+   the pet ghosts through), the pet is cut off at the card's top edge. The cut
+   runs exactly along that edge, so it's never visible. */
+#pet-clip {
+  position: relative;
+  /* Just enough for the pet at full stretch, plus the badge above his head. */
+  height: 104px;
+  overflow: hidden;
+}
+
+/* --- usage HUD --- */
+
+#hud {
+  position: relative;
+  z-index: 4;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.82);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  font: 400 11px -apple-system, BlinkMacSystemFont, sans-serif;
+  pointer-events: auto;
+}
+
+.row-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.label {
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.pct {
+  font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #fff;
+}
+
+.bar {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.15);
+  overflow: hidden;
+}
+
+.fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+.fill.disk {
+  background: #0a84ff;
+}
+.fill.mem {
+  background: #30d158;
+}
+/* Both Claude limits sit in the same orange family, so the two machine bars and
+   the two Claude bars read as pairs at a glance. */
+.fill.session {
+  background: #eda184;
+}
+.fill.week {
+  background: #d97757;
+}
+
+.row.hidden {
+  display: none;
+}
+
+.detail {
+  margin-top: 4px;
+  font: 400 9px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+/* --- pet --- */
+
+/* Two nested elements on purpose: #pet owns how far the pet has risen out from
+   behind the card, #pet-body owns the per-state bobbing/shaking. Keeping them
+   apart lets the rise ease smoothly while an animation is already running. */
 #pet {
   position: absolute;
-  left: 27px;
-  top: 14px;
+  /* Slung low in the clip box so only the top of his head clears the card. */
+  right: 20px;
+  bottom: -82px;
   width: 86px;
   height: 104px;
   --block: #d97757;
-  transition: --block 0.3s ease;
+  transition: transform 0.45s cubic-bezier(0.34, 1.4, 0.64, 1), --block 0.3s ease;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+#pet-body {
+  position: absolute;
+  inset: 0;
 }
 
 @property --block {
@@ -104,10 +216,11 @@ body {
   left: 24px;
 }
 
+/* Sits on the pet, so it rides up with him when he pops out. */
 #badge {
   position: absolute;
-  top: 4px;
-  right: 8px;
+  top: -8px;
+  right: -4px;
   min-width: 20px;
   height: 20px;
   padding: 0 4px;
@@ -119,29 +232,34 @@ body {
   justify-content: center;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
   display: none;
-  z-index: 5;
+  z-index: 4;
 }
 body.alert #badge.show {
   display: flex;
 }
 
-/* idle */
-body.idle #pet {
-  animation: bob 2.6s ease-in-out infinite;
+/* idle — lurking behind the card, only the top of his head showing, with the
+   occasional slow peer up over the edge */
+body.idle #pet-body {
+  animation: peer 5s ease-in-out infinite;
 }
-@keyframes bob {
+@keyframes peer {
   0%,
+  62%,
   100% {
     transform: translateY(0);
   }
-  50% {
-    transform: translateY(-6px);
+  30% {
+    transform: translateY(-7px);
   }
 }
 
-/* working */
+/* working — leaning up over the card, arms going */
 body.working #pet {
   --block: #c2410c;
+  transform: translateY(-22px);
+}
+body.working #pet-body {
   animation: bounce 0.55s ease-in-out infinite;
 }
 @keyframes bounce {
@@ -150,10 +268,10 @@ body.working #pet {
     transform: translateY(0) scaleX(1);
   }
   30% {
-    transform: translateY(-12px) scaleX(0.95);
+    transform: translateY(-7px) scaleX(0.96);
   }
   60% {
-    transform: translateY(0) scaleX(1.06);
+    transform: translateY(0) scaleX(1.05);
   }
 }
 body.working .arm.left {
@@ -193,9 +311,12 @@ body.working .eye {
   }
 }
 
-/* alert */
+/* alert — pops all the way up over the card and waves both arms */
 body.alert #pet {
   --block: #dc2626;
+  transform: translateY(-66px);
+}
+body.alert #pet-body {
   animation: shake 0.35s ease-in-out infinite;
 }
 body.alert .head {
@@ -212,5 +333,29 @@ body.alert .head {
   }
   75% {
     transform: translateX(5px) rotate(4deg);
+  }
+}
+body.alert .arm.left {
+  animation: wave-left 0.5s ease-in-out infinite;
+}
+body.alert .arm.right {
+  animation: wave-right 0.5s ease-in-out infinite;
+}
+@keyframes wave-left {
+  0%,
+  100% {
+    transform: rotate(-150deg);
+  }
+  50% {
+    transform: rotate(-125deg);
+  }
+}
+@keyframes wave-right {
+  0%,
+  100% {
+    transform: rotate(150deg);
+  }
+  50% {
+    transform: rotate(125deg);
   }
 }
