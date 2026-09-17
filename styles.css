@@ -23,14 +23,39 @@ body {
 
 /* Stacking the clip box directly on top of the card is what ties the two
    together: the box's bottom edge is the card's top edge whatever height the
-   card ends up being, so that's the line the pet is hidden below. */
+   card ends up being, so that's the line the pet is hidden below.
+
+   The window is docked flush to the bottom of the screen, so sliding the stack
+   down by exactly the card's height drops the card off-screen and leaves the
+   pet's head — which sits immediately above it — peeking over the edge. The
+   renderer measures the card and publishes it as --hud-h, since the card's
+   height changes as the Claude rows come and go. */
 #stack {
   position: absolute;
   left: 8px;
-  bottom: 8px;
+  bottom: 0;
   width: 200px;
   display: flex;
   flex-direction: column;
+  transform: translateY(var(--hud-h, 210px));
+}
+
+/* Only after the card has been measured once, so the correction from the
+   fallback height to the real one doesn't play as a slide on launch. */
+body.ready #stack {
+  transition: transform 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+body.expanded #stack {
+  transform: translateY(0);
+}
+
+/* Someone who prefers less motion still gets the peek and the expand, just
+   without the slide. */
+@media (prefers-reduced-motion: reduce) {
+  body.ready #stack {
+    transition: none;
+  }
 }
 
 /* Rather than relying on the card being opaque enough to cover him (it isn't —
@@ -106,8 +131,10 @@ body {
   background: #d97757;
 }
 
-.row.hidden {
-  display: none;
+/* Numbers that are no longer current. Dim enough to read as inactive at a
+   glance, still legible if you look. */
+.row.stale {
+  opacity: 0.4;
 }
 
 .detail {

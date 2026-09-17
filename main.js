@@ -4,20 +4,57 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
+const https = require('https');
 
 const PORT = 47823;
 // Sized for the card at its tallest (all four rows) plus the headroom the pet
-// pops up into above it. The card is pinned to the bottom of the window, so when
-// the Claude usage rows are hidden the slack just becomes more click-through
-// empty space.
+// pops up into above it. The window is docked to the bottom of the screen and
+// never moves vertically; the card slides within it, so the height has to cover
+// the fully expanded state even though most of it is empty most of the time.
+// That empty space stays click-through.
 const WIN_W = 216;
-// 320 is what the four-row card plus the pet's clip box measures; the extra 8
-// matches the inset at the bottom and leaves room for font metrics to vary.
+// The four-row card plus the pet's clip box, with a little slack for font
+// metrics varying between displays.
 const WIN_H = 328;
 const MARGIN = 20;
 const USAGE_INTERVAL_MS = 3000;
 const CONFIG_PATH = path.join(app.getPath('userData'), 'pet-config.json');
 const LIMITS_PATH = path.join(os.homedir(), '.claude', 'pet-limits.json');
+// Claude's own usage windows, polled straight from the API. The status line was
+// the only source before, which meant the rows went dark any time you spent a
+// few hours without a terminal session rendering one.
+const USAGE_POLL_MS = 5 * 60 * 1000;
+// Backed off to this after a failed poll so a rate-limited or down endpoint
+// doesn't get hammered every five minutes.
+const USAGE_BACKOFF_MS = 15 * 60 * 1000;
+const USAGE_API = 'https://api.anthropic.com/api/oauth/usage';
+const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+// Count a token as due for renewal slightly before it actually lapses, so a slow
+// request can't land on the far side of the expiry.
+const TOKEN_SKEW_MS = 60 * 1000;
+// The pet never refreshes the token itself and never writes to the keychain. The
+// server rotates the refresh token on every refresh, so whoever refreshes has to
+// persist the rotated value back or the *other* holder of that credential is
+// silently logged out — which is exactly what this app used to do to the CLI.
+// So renewal is handed to the tool that owns the credential: run a cheap
+// authenticated CLI command, let Claude Code refresh and store the result the
+// way it already knows how, then read back what it wrote. `doctor` is the light
+// one (under a second, no inference, no MCP servers started); `mcp list` is a
+// fallback in case `doctor` ever stops making an authenticated call.
+const CLAUDE_REFRESH_ARGS = [['doctor'], ['mcp', 'list']];
+// A GUI launch inherits almost no PATH, so the CLI is found by absolute path
+// first and only then left to PATH.
+const CLAUDE_BIN_CANDIDATES = [
+  path.join(os.homedir(), '.local', 'bin', 'claude'),
+  '/opt/homebrew/bin/claude',
+  '/usr/local/bin/claude',
+];
+// Floor between renewal attempts. A renewal that fails usually means a signed-out
+// CLI, which running it again won't fix.
+const REFRESH_COOLDOWN_MS = 5 * 60 * 1000;
+// Last good response, so a restart shows numbers immediately instead of waiting
+// out a poll interval with empty rows.
+const USAGE_CACHE_PATH = path.join(app.getPath('userData'), 'usage-cache.json');
 const CLAUDE_BUNDLE_ID = 'com.anthropic.claudefordesktop';
 
 // A session is "stale" (probably crashed/closed without a SessionEnd hook firing)
@@ -76,37 +113,283 @@ function memoryUsage(cb) {
   });
 }
 
-// Nothing refreshes the limits file until the next status line renders, so a
-// window that has already rolled over would be showing a stale percentage of a
-// limit that no longer applies. Better to show nothing than a wrong number.
-function usageWindow(w) {
-  if (!w || !Number.isFinite(w.used_percentage)) return null;
-  if (Number.isFinite(w.resets_at) && w.resets_at * 1000 <= Date.now()) return null;
-  return { percent: w.used_percentage, resetsAt: w.resets_at };
+// The API hands back `utilization` already scaled 0-100, and `resets_at` as an
+// ISO-8601 string. The status-line file used different names and a unix epoch,
+// so both sources get normalised to this shape before anything else sees them.
+function normalizeWindow(percent, resetsAt) {
+  if (!Number.isFinite(percent)) return null;
+  let resetsAtMs = null;
+  if (typeof resetsAt === 'string') {
+    const parsed = Date.parse(resetsAt);
+    if (Number.isFinite(parsed)) resetsAtMs = parsed;
+  } else if (Number.isFinite(resetsAt)) {
+    // Epoch seconds from the status-line file; epoch millis would be ~1e12.
+    resetsAtMs = resetsAt < 1e11 ? resetsAt * 1000 : resetsAt;
+  }
+  return { percent, resetsAtMs };
 }
 
-// Claude's subscription usage windows are only handed to Claude Code's status
-// line — they're in no hook payload — so the status line writes them to this file
-// and we just read whatever is there. Nothing here means don't show those rows at
-// all: Bedrock and Vertex sessions have no subscription windows, and an
-// unconfigured status line never writes the file in the first place.
-function claudeLimits() {
-  let limits;
-  try {
-    limits = JSON.parse(fs.readFileSync(LIMITS_PATH, 'utf8'))?.rate_limits;
-  } catch {
-    return { session: null, weekly: null };
+// Claude Code stores its OAuth credentials in the login keychain. The pet only
+// ever reads them, at the moment of use, and never logs them or writes them back.
+// `state` distinguishes a signed-out CLI (nothing stored) from the pet simply
+// being unable to read what is there — only the first is the user's to fix.
+function readCredentials(cb) {
+  execFile('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'], { timeout: 3000 }, (err, stdout, stderr) => {
+    if (err) {
+      // `security` exits 44 when the item isn't there at all.
+      const missing = err.code === 44 || /could not be found/i.test(stderr || '');
+      return cb(null, missing ? 'missing' : 'unreadable');
+    }
+    try {
+      const blob = JSON.parse(stdout);
+      if (!blob?.claudeAiOauth?.accessToken) return cb(null, 'missing');
+      cb(blob, 'ok');
+    } catch {
+      cb(null, 'unreadable');
+    }
+  });
+}
+
+function usableToken(blob) {
+  const oauth = blob?.claudeAiOauth;
+  if (!oauth?.accessToken || !Number.isFinite(oauth.expiresAt)) return null;
+  if (oauth.expiresAt <= Date.now() + TOKEN_SKEW_MS) return null;
+  return oauth.accessToken;
+}
+
+let claudeBin;
+function resolveClaudeBin() {
+  if (claudeBin !== undefined) return claudeBin;
+  claudeBin = CLAUDE_BIN_CANDIDATES.find((candidate) => {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }) || 'claude';
+  return claudeBin;
+}
+
+// Guards against two renewals racing, and against retrying one that isn't going
+// to work.
+let refreshInFlight = null;
+let lastRefreshAt = 0;
+
+// Asks the CLI to renew its own credential, then reports whether a usable token
+// actually appeared. The command's exit status is ignored on purpose — the only
+// thing that matters is what ended up in the keychain afterwards.
+function refreshViaCli(cb) {
+  if (refreshInFlight) return refreshInFlight.push(cb);
+  if (Date.now() - lastRefreshAt < REFRESH_COOLDOWN_MS) {
+    return cb(new Error('waiting out the renewal cooldown'));
   }
-  return { session: usageWindow(limits?.five_hour), weekly: usageWindow(limits?.seven_day) };
+  refreshInFlight = [cb];
+  const settle = (err) => {
+    lastRefreshAt = Date.now();
+    const waiting = refreshInFlight;
+    refreshInFlight = null;
+    for (const fn of waiting) fn(err);
+  };
+
+  const bin = resolveClaudeBin();
+  // Run from the home directory so no project's settings or trust state is in play.
+  const attempt = (i) => {
+    if (i >= CLAUDE_REFRESH_ARGS.length) return settle(new Error("the CLI didn't renew the token"));
+    execFile(bin, CLAUDE_REFRESH_ARGS[i], { timeout: 90000, cwd: os.homedir() }, () => {
+      readCredentials((blob) => (usableToken(blob) ? settle(null) : attempt(i + 1)));
+    });
+  };
+  attempt(0);
+}
+
+function withAccessToken(forceRefresh, cb) {
+  readCredentials((blob, state) => {
+    const token = usableToken(blob);
+    if (token && !forceRefresh) return cb(null, token);
+    if (state === 'missing') {
+      // Nothing stored: a signed-out CLI, or a setup that never had a
+      // subscription token at all (Bedrock, Vertex, a plain API key).
+      const err = new Error('no Claude Code credentials in the keychain');
+      err.signedOut = true;
+      return cb(err);
+    }
+    refreshViaCli((refreshErr) => {
+      if (refreshErr) {
+        // A token we already hold beats failing outright, even when the 401 that
+        // sent us here says it probably won't work.
+        if (token) return cb(null, token);
+        return cb(refreshErr);
+      }
+      readCredentials((renewed) => {
+        const fresh = usableToken(renewed);
+        if (fresh) return cb(null, fresh);
+        cb(new Error('no usable token after the CLI renewed it'));
+      });
+    });
+  });
+}
+
+// Deliberately vague on failure: the token must never reach a log line.
+function fetchUsage(token, cb) {
+  const req = https.request(USAGE_API, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'anthropic-beta': 'oauth-2025-04-20',
+      'Content-Type': 'application/json',
+    },
+    timeout: 5000,
+  }, (res) => {
+    let body = '';
+    res.setEncoding('utf8');
+    res.on('data', (chunk) => { body += chunk; });
+    res.on('end', () => {
+      if (res.statusCode !== 200) {
+        const err = new Error(`usage API ${res.statusCode}`);
+        err.statusCode = res.statusCode;
+        return cb(err);
+      }
+      try {
+        cb(null, JSON.parse(body));
+      } catch {
+        cb(new Error('usage API returned malformed JSON'));
+      }
+    });
+  });
+  req.on('timeout', () => req.destroy(new Error('usage API timed out')));
+  req.on('error', cb);
+  req.end();
+}
+
+function loadUsageCache() {
+  try {
+    const cached = JSON.parse(fs.readFileSync(USAGE_CACHE_PATH, 'utf8'));
+    if (Number.isFinite(cached?.fetchedAt)) return cached;
+  } catch {
+    // no cache yet, or it's unreadable; we'll have numbers after the first poll
+  }
+  return null;
+}
+
+function saveUsageCache(usage) {
+  try {
+    fs.writeFileSync(USAGE_CACHE_PATH, JSON.stringify(usage));
+  } catch {
+    // best-effort; the in-memory copy is what actually drives the display
+  }
+}
+
+// Seeded from disk so a restart draws real numbers immediately rather than
+// blank rows until the first poll lands.
+let claudeUsage = loadUsageCache();
+
+// Past this the numbers are old enough that they shouldn't be read as current.
+// The rows stay put either way — they're the reason the card exists, and a row
+// that removes itself just looks like the pet is broken. It goes dim and says
+// why instead.
+const USAGE_MAX_AGE_MS = 60 * 60 * 1000;
+
+// Why the last poll didn't land, phrased for a 200px-wide card. Signed-out is
+// tracked apart from every other failure because it is the only one the user can
+// do anything about — and telling them to log in when they aren't logged out is
+// how this card spent a day crying wolf.
+let usageNote = null;
+let usageSignedOut = false;
+
+// "12m old" / "3h old" / "2d old" — an age the card has room for.
+function ageNote(ms) {
+  const mins = Math.max(Math.round(ms / 60000), 1);
+  if (mins < 60) return `${mins}m old`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h old`;
+  return `${Math.round(hours / 24)}d old`;
+}
+
+function currentClaudeUsage() {
+  if (!claudeUsage) {
+    return { session: null, weekly: null, stale: true, note: usageNote || 'waiting for first poll' };
+  }
+  const age = Date.now() - claudeUsage.fetchedAt;
+  const stale = age > USAGE_MAX_AGE_MS;
+  return {
+    session: claudeUsage.session,
+    weekly: claudeUsage.weekly,
+    stale,
+    // Being signed out is worth naming; anything else, the honest thing to show
+    // is how old the numbers on screen actually are.
+    note: stale ? (usageSignedOut ? 'run claude auth login' : ageNote(age)) : null,
+  };
+}
+
+// Fallback for the case the API can't cover: Bedrock/Vertex/API-key setups have
+// no subscription windows and no keychain entry, but a status line may still
+// have left something behind.
+function statusLineLimits() {
+  try {
+    const file = JSON.parse(fs.readFileSync(LIMITS_PATH, 'utf8'));
+    const limits = file?.rate_limits;
+    const session = normalizeWindow(limits?.five_hour?.used_percentage, limits?.five_hour?.resets_at);
+    const weekly = normalizeWindow(limits?.seven_day?.used_percentage, limits?.seven_day?.resets_at);
+    if (!session && !weekly) return null;
+    // The file's own timestamp, not now — otherwise a status line that last ran
+    // yesterday would look like a fresh reading and sail past the staleness gate.
+    if (!Number.isFinite(file?.ts)) return null;
+    return { session, weekly, fetchedAt: file.ts * 1000 };
+  } catch {
+    return null;
+  }
+}
+
+function pollClaudeUsage() {
+  const reschedule = (ms) => setTimeout(pollClaudeUsage, ms);
+  const failed = (reason, signedOut) => {
+    // Only fall back to the status-line file while we've never had a good poll;
+    // once the API has answered, its numbers are strictly fresher.
+    if (!claudeUsage) {
+      const fromFile = statusLineLimits();
+      if (fromFile) claudeUsage = fromFile;
+    }
+    usageSignedOut = Boolean(signedOut);
+    usageNote = signedOut ? 'run claude auth login' : null;
+    console.error(`[pet] usage poll failed: ${reason}`);
+    reschedule(USAGE_BACKOFF_MS);
+  };
+
+  const succeeded = (data) => {
+    const session = normalizeWindow(data?.five_hour?.utilization, data?.five_hour?.resets_at);
+    const weekly = normalizeWindow(data?.seven_day?.utilization, data?.seven_day?.resets_at);
+    if (!session && !weekly) return failed('no subscription windows in response');
+    claudeUsage = { session, weekly, fetchedAt: Date.now() };
+    usageNote = null;
+    usageSignedOut = false;
+    saveUsageCache(claudeUsage);
+    reschedule(USAGE_POLL_MS);
+  };
+
+  // A 401 on a token we believed was current means it was revoked or rotated out
+  // from under us, so force one refresh and try again before giving up.
+  const attempt = (forceRefresh) => {
+    withAccessToken(forceRefresh, (tokenErr, token) => {
+      if (tokenErr) return failed(tokenErr.message, tokenErr.signedOut);
+      fetchUsage(token, (err, data) => {
+        if (err && err.statusCode === 401 && !forceRefresh) return attempt(true);
+        if (err) return failed(err.message);
+        succeeded(data);
+      });
+    });
+  };
+
+  attempt(false);
 }
 
 function sampleUsage() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const disk = diskUsage();
-  const { session, weekly } = claudeLimits();
+  const { session, weekly, stale, note } = currentClaudeUsage();
   memoryUsage((memory) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
-    mainWindow.webContents.send('pet-usage', { disk, memory, session, weekly });
+    mainWindow.webContents.send('pet-usage', { disk, memory, session, weekly, stale, note });
   });
 }
 
@@ -239,26 +522,43 @@ function startServer() {
   server.listen(PORT, '127.0.0.1');
 }
 
-// Top-right, where the standalone usage HUD used to sit. The card is at the
-// bottom of the window, so this leaves the pet's pop-up headroom on screen.
-function defaultPosition() {
-  const { x: wx, y: wy, width: ww } = screen.getPrimaryDisplay().workArea;
-  return { x: wx + ww - WIN_W - MARGIN, y: wy + MARGIN };
+// Over on the right, out of the way of anything centred. Only x is ever chosen:
+// the window is pinned to the bottom of the screen and the card sits below that
+// edge until the pet is hovered, so vertical position isn't the pet's to pick.
+function defaultX() {
+  const { x: wx, width: ww } = screen.getPrimaryDisplay().workArea;
+  return wx + ww - WIN_W - MARGIN;
 }
 
-// A position saved by an earlier (smaller) window can put the pet partly off
-// screen, and so can unplugging a display, so pull it back into the work area.
-function clampToWorkArea(x, y) {
-  const area = screen.getDisplayNearestPoint({ x, y }).workArea;
+// The work area rather than the full display, so the pet peeks above the Dock
+// instead of behind it. Resolved against whichever display that x lands on, and
+// clamped there — a saved position can outlive the display it was saved on.
+function dockedPosition(x) {
+  const wanted = Number.isFinite(x) ? Math.round(x) : defaultX();
+  const primary = screen.getPrimaryDisplay().workArea;
+  const area = screen.getDisplayNearestPoint({
+    x: wanted + Math.round(WIN_W / 2),
+    y: primary.y + primary.height - 1,
+  }).workArea;
   return {
-    x: Math.min(Math.max(x, area.x), area.x + area.width - WIN_W),
-    y: Math.min(Math.max(y, area.y), area.y + area.height - WIN_H),
+    x: Math.min(Math.max(wanted, area.x), area.x + area.width - WIN_W),
+    y: area.y + area.height - WIN_H,
   };
+}
+
+// Resolution changes, a display being unplugged, and the Dock being shown or
+// hidden all move the bottom edge out from under the pet, so re-dock whenever
+// the screen layout shifts.
+function redock() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const [px] = mainWindow.getPosition();
+  const { x, y } = dockedPosition(px);
+  mainWindow.setPosition(x, y);
 }
 
 function createWindow() {
   const cfg = loadConfig();
-  const saved = Number.isFinite(cfg.x) && Number.isFinite(cfg.y) ? clampToWorkArea(cfg.x, cfg.y) : defaultPosition();
+  const saved = dockedPosition(cfg.x);
 
   mainWindow = new BrowserWindow({
     width: WIN_W,
@@ -289,8 +589,8 @@ function createWindow() {
   mainWindow.on('moved', () => {
     clearTimeout(moveTimeout);
     moveTimeout = setTimeout(() => {
-      const [px, py] = mainWindow.getPosition();
-      saveConfig({ x: px, y: py });
+      const [px] = mainWindow.getPosition();
+      saveConfig({ x: px });
     }, 300);
   });
 
@@ -327,14 +627,16 @@ function startDrag(_event, grab) {
   // the drag exact: anchoring to the cursor's position now would instead shift
   // the pet by however far it travelled before we heard about the drag.
   const grabX = Number.isFinite(grab?.grabX) ? grab.grabX : WIN_W / 2;
-  const grabY = Number.isFinite(grab?.grabY) ? grab.grabY : WIN_H / 2;
   dragTimer = setInterval(() => {
     if (!mainWindow || mainWindow.isDestroyed()) {
       stopDrag();
       return;
     }
+    // Horizontal only. The pet lives on the bottom edge, so a drag slides him
+    // along it to a less annoying spot rather than lifting him off it.
     const p = screen.getCursorScreenPoint();
-    mainWindow.setPosition(Math.round(p.x - grabX), Math.round(p.y - grabY));
+    const { x, y } = dockedPosition(p.x - grabX);
+    mainWindow.setPosition(x, y);
   }, 16);
 }
 
@@ -379,9 +681,9 @@ function createTray() {
     {
       label: 'Reset Position',
       click: () => {
-        const { x, y } = defaultPosition();
+        const { x, y } = dockedPosition(defaultX());
         mainWindow.setPosition(x, y);
-        saveConfig({ x, y });
+        saveConfig({ x });
       },
     },
     { type: 'separator' },
@@ -410,8 +712,12 @@ app.whenReady().then(() => {
   registerIpc();
   createWindow();
   createTray();
+  for (const event of ['display-metrics-changed', 'display-added', 'display-removed']) {
+    screen.on(event, redock);
+  }
   setInterval(sweepStaleSessions, 5 * 60 * 1000);
   setInterval(sampleUsage, USAGE_INTERVAL_MS);
+  pollClaudeUsage();
 });
 
 app.on('window-all-closed', (e) => e.preventDefault());

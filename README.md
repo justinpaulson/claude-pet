@@ -21,15 +21,13 @@ notification — when a session needs your approval.
   "used" — Node's `os.freemem()` counts only free pages and reads as ~100%
   used on any warm machine).
 - The SESSION and WEEKLY rows are your Claude subscription's 5-hour and 7-day
-  usage windows. Those numbers reach exactly one place: Claude Code's **status
-  line** payload (`rate_limits.five_hour` / `.seven_day`) — no hook carries
-  them. So the status line writes them to `~/.claude/pet-limits.json` and the
-  pet reads that file. See "Usage limit rows" below.
-- Either row hides itself entirely when there's no number for it, rather than
-  showing an empty bar that reads as 0% used. That covers sessions with no
-  subscription window at all (Bedrock, Vertex, plain API keys), a status line
-  that isn't wired up, and a window whose `resets_at` has already passed —
-  stale data would be a percentage of a limit that no longer applies.
+  usage windows, polled every 5 minutes from `api.anthropic.com/api/oauth/usage`
+  with the OAuth token Claude Code keeps in your login keychain. See "Usage limit
+  rows" below.
+- Those two rows are always drawn — they're the reason the card exists. When the
+  numbers can't be refreshed the row dims and its detail line says how old they
+  are ("3h old") instead of the reset time. It only tells you to log in when
+  Claude Code genuinely has no credentials stored.
 - The window is only click-through where it's empty: the space the pet pops up
   into passes clicks to whatever is underneath, and the window starts taking
   clicks again once the cursor reaches the card or the pet.
@@ -62,26 +60,34 @@ done; otherwise see `hooks-snippet.json` in this repo.
 
 ## Usage limit rows
 
-The two Claude rows need a status line, because that payload is the only thing
-that carries `rate_limits`. Point `statusLine` in `~/.claude/settings.json` at a
-script, and have that script stash the limits where the pet can find them:
+These need no setup. The pet reads Claude Code's OAuth access token from the
+`Claude Code-credentials` keychain item and polls the usage endpoint directly.
 
-```bash
-limits=$(echo "$input" | jq -c '.rate_limits // empty') || return 0
-[ -n "$limits" ] || return 0    # nothing to report; leave the old file alone
-printf '{"ts":%s,"rate_limits":%s}\n' "$(date +%s)" "$limits" > "$tmp" && mv -f "$tmp" "$out"
-```
+**The pet never writes to the keychain, and never refreshes the token itself.**
+That matters more than it sounds. The server rotates the refresh token on every
+refresh, so whoever refreshes has to store the rotated value back — otherwise the
+*other* holder of that credential is silently logged out. An earlier version of
+this app refreshed without persisting, which logged the CLI out roughly every
+8 hours and had the card telling you to run `claude auth login` over and over.
 
-Two details worth keeping:
+So renewal is delegated to the tool that owns the credential. When the stored
+token is within a minute of expiring, the pet runs `claude doctor` — a cheap
+authenticated command, well under a second, no inference and no MCP servers
+started — which makes Claude Code refresh and store the result the way it already
+knows how. The pet then reads back what the CLI wrote. `claude mcp list` is kept
+as a fallback in case `doctor` ever stops making an authenticated call. Renewals
+are serialised and rate-limited to one attempt per 5 minutes.
 
-- **Bail out when `rate_limits` is empty.** Sessions that don't run on a
-  subscription (Bedrock, Vertex, API key) render a status line with no usage
-  windows in it. Writing the file anyway would blank the rows every time one of
-  those sessions redrew.
-- **Write via a temp file and `mv`.** The pet re-reads the file every 3s and
-  shouldn't be able to catch a half-written one.
+Two consequences worth knowing:
 
-The rows appear on their own once the file shows up, and stay hidden until then.
+- **Nothing to configure, and no re-login cycle.** It keeps working whether you
+  live in the terminal or the desktop app.
+- **The status-line file is still read, as a fallback.** Setups with no
+  subscription token at all (Bedrock, Vertex, a plain API key) have no keychain
+  entry to poll, so if `~/.claude/pet-limits.json` exists the pet will use it —
+  see `statusline-command.sh` for the shape. Its numbers are only used until the
+  API answers once, and they carry the file's own timestamp so old data is shown
+  as old rather than as current.
 
 ## Packaging (optional)
 

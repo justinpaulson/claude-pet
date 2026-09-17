@@ -40,9 +40,9 @@
             <div class="bar"><div class="fill mem" id="mem-fill"></div></div>
             <div class="detail" id="mem-detail">— / — GB</div>
           </div>
-          <!-- Claude's own usage windows. Only shown once its status line has
-               reported them; hidden entirely otherwise. -->
-          <div class="row hidden" id="row-session">
+          <!-- Claude's own usage windows. Always present: they dim and explain
+               themselves when there's nothing current to show. -->
+          <div class="row" id="row-session">
             <div class="row-top">
               <span class="label">SESSION</span>
               <span class="pct" id="session-pct">—</span>
@@ -50,7 +50,7 @@
             <div class="bar"><div class="fill session" id="session-fill"></div></div>
             <div class="detail" id="session-detail">—</div>
           </div>
-          <div class="row hidden" id="row-weekly">
+          <div class="row" id="row-weekly">
             <div class="row-top">
               <span class="label">WEEKLY</span>
               <span class="pct" id="week-pct">—</span>
