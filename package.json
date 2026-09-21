@@ -5,9 +5,12 @@
   "main": "main.js",
   "private": true,
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "build": "npx @electron/packager . ClaudePet --platform=darwin --arch=arm64 --app-bundle-id=com.justinpaulson.claudepet --extend-info=build-info.plist --out=dist --overwrite --prune=true --ignore='^/(dist|\\.claude|hooks-snippet\\.json|README\\.md|build-info\\.plist)' && codesign --force --deep --sign - dist/ClaudePet-darwin-arm64/ClaudePet.app",
+    "install-app": "npm run build && rm -rf ~/Applications/ClaudePet.app && cp -R dist/ClaudePet-darwin-arm64/ClaudePet.app ~/Applications/ && echo 'installed to ~/Applications/ClaudePet.app'"
   },
   "devDependencies": {
+    "@electron/packager": "^18.4.4",
     "electron": "^33.0.0"
   }
 }

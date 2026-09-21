@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Menu-bar-only: no Dock tile, no app switcher entry. main.js also calls
+         app.dock.hide(), but that runs late enough to flash an icon at launch. -->
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>

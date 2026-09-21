@@ -50,8 +50,8 @@ remembered. Click the pet to bring the Claude desktop app to the front,
 launching it if it isn't already running. Right-click the menu bar icon for
 Show/Hide, Reset Position, Start at Login, and Quit.
 
-This replaces the standalone `usage-hud` menu-bar app — quit that one so you
-don't end up with two cards on screen.
+This replaces the standalone `usage-hud` menu-bar app — quit that one, and turn
+off its login item, so you don't end up with two cards on screen.
 
 **Hooks are configured separately** — see the `hooks` block that should be
 merged into `~/.claude/settings.json` so Claude Code actually reports events
@@ -89,12 +89,44 @@ Two consequences worth knowing:
   API answers once, and they carry the file's own timestamp so old data is shown
   as old rather than as current.
 
-## Packaging (optional)
+## Packaging and starting at login
 
-To get a real `.app` you can drop in `~/Applications` and enable "Start at
-Login" without keeping a terminal open:
+`npm start` is a foreground Electron process owned by whatever terminal launched
+it, so it dies with that terminal and doesn't survive a restart. For a copy that
+comes back on its own, build the bundle and install it:
 
 ```bash
-npm install --save-dev electron-builder
-npx electron-builder --mac --dir
+npm run install-app
 ```
+
+That packages `ClaudePet.app` into `dist/` and copies it to `~/Applications`.
+Then turn on **Start at Login** in the menu-bar menu (or run the app once and
+toggle it) and it will be there after the next restart.
+
+Two details the build script exists to handle:
+
+- **Re-signing.** `@electron/packager` leaves the Electron binary's
+  linker-signed ad-hoc signature in place, which no longer matches the rewritten
+  bundle — `codesign -v` reports "code has no resources but signature indicates
+  they must be present" and macOS may refuse to launch it. The build re-signs
+  ad-hoc afterwards.
+- **`electron-builder` is not used.** Its current release pulls in an ESM-only
+  `@noble/hashes`, which Node 20.18 can't `require()`. `@electron/packager` is
+  all this needs, since there's no installer to produce.
+
+### How "Start at Login" works
+
+It writes `~/Library/LaunchAgents/com.justinpaulson.claudepet.plist`, a
+`RunAtLoad` agent that runs `open -a ~/Applications/ClaudePet.app`.
+
+It deliberately does **not** use `app.setLoginItemSettings`, which registers
+`process.execPath` with no arguments. From a packaged app that happens to be
+right, but from `npm start` that path is the bare Electron helper inside
+`node_modules` — so login brought up an empty default Electron window instead of
+the pet, while the checkbox sat there looking like it had worked. Naming the
+command in a plist is correct in both modes, and the checkbox just reflects
+whether the file is there.
+
+Rebuilding changes the ad-hoc code signature but not the bundle path, so the
+login agent keeps working across rebuilds; re-run `npm run install-app` and the
+next login picks up the new build.

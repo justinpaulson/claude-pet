@@ -57,6 +57,15 @@ const REFRESH_COOLDOWN_MS = 5 * 60 * 1000;
 const USAGE_CACHE_PATH = path.join(app.getPath('userData'), 'usage-cache.json');
 const CLAUDE_BUNDLE_ID = 'com.anthropic.claudefordesktop';
 
+// "Start at Login" is a LaunchAgent rather than `app.setLoginItemSettings`,
+// which registers `process.execPath` with no arguments. For an unpackaged run
+// that path is the bare Electron helper under node_modules, so login brought up
+// an empty default Electron window instead of the pet — and the checkbox looked
+// like it had worked. A plist names the real command, which is correct both
+// from a dev run and from the installed .app.
+const LOGIN_LABEL = 'com.justinpaulson.claudepet';
+const LOGIN_PLIST = path.join(os.homedir(), 'Library', 'LaunchAgents', `${LOGIN_LABEL}.plist`);
+
 // A session is "stale" (probably crashed/closed without a SessionEnd hook firing)
 // if we haven't heard from it in this long. Swept periodically so the pet
 // doesn't get stuck alerting/working forever for a dead session.
@@ -668,6 +677,50 @@ const TRAY_ICONS = Object.fromEntries(
   Object.entries(TRAY_ICON_DATA).map(([k, v]) => [k, nativeImage.createFromDataURL(v)])
 );
 
+// `open -a <bundle>` for the installed app, which activates the copy that's
+// already running instead of starting a second one; the Electron binary plus
+// this project's directory when running from the repo.
+function loginArgs() {
+  if (app.isPackaged) {
+    return ['/usr/bin/open', '-a', path.resolve(path.dirname(process.execPath), '..', '..')];
+  }
+  return [process.execPath, app.getAppPath()];
+}
+
+function loginPlist() {
+  const args = loginArgs().map((a) => `        <string>${a}</string>`).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LOGIN_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+${args}
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+`;
+}
+
+function setStartAtLogin(on) {
+  const domain = `gui/${process.getuid()}`;
+  if (on) {
+    fs.mkdirSync(path.dirname(LOGIN_PLIST), { recursive: true });
+    fs.writeFileSync(LOGIN_PLIST, loginPlist());
+    // Bootstrapping now registers it with the login-items database, so it shows
+    // up in System Settings straight away rather than only after a restart.
+    execFile('launchctl', ['bootstrap', domain, LOGIN_PLIST], () => {});
+  } else {
+    execFile('launchctl', ['bootout', `${domain}/${LOGIN_LABEL}`], () => {
+      fs.rmSync(LOGIN_PLIST, { force: true });
+    });
+  }
+}
+
 function createTray() {
   tray = new Tray(TRAY_ICONS.idle);
   const menu = Menu.buildFromTemplate([
@@ -690,8 +743,8 @@ function createTray() {
     {
       label: 'Start at Login',
       type: 'checkbox',
-      checked: app.getLoginItemSettings().openAtLogin,
-      click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked }),
+      checked: fs.existsSync(LOGIN_PLIST),
+      click: (item) => setStartAtLogin(item.checked),
     },
     { type: 'separator' },
     { label: 'Quit Claude Pet', click: () => app.quit() },
