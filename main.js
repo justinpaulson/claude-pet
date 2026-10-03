@@ -142,8 +142,12 @@ function normalizeWindow(percent, resetsAt) {
 // ever reads them, at the moment of use, and never logs them or writes them back.
 // `state` distinguishes a signed-out CLI (nothing stored) from the pet simply
 // being unable to read what is there — only the first is the user's to fix.
+// The lookup is pinned to the user's account: other entries can share the
+// service name (e.g. one under account "unknown" holding only MCP OAuth tokens),
+// and an unpinned lookup returns whichever the keychain finds first.
 function readCredentials(cb) {
-  execFile('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'], { timeout: 3000 }, (err, stdout, stderr) => {
+  const args = ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', os.userInfo().username, '-w'];
+  execFile('security', args, { timeout: 3000 }, (err, stdout, stderr) => {
     if (err) {
       // `security` exits 44 when the item isn't there at all.
       const missing = err.code === 44 || /could not be found/i.test(stderr || '');
