@@ -22,12 +22,11 @@ notification — when a session needs your approval.
   used on any warm machine).
 - The SESSION and WEEKLY rows are your Claude subscription's 5-hour and 7-day
   usage windows, polled every 5 minutes from `api.anthropic.com/api/oauth/usage`
-  with the OAuth token Claude Code keeps in your login keychain. See "Usage limit
-  rows" below.
+  with the pet's own Claude login. See "Usage limit rows" below.
 - Those two rows are always drawn — they're the reason the card exists. When the
   numbers can't be refreshed the row dims and its detail line says how old they
-  are ("3h old") instead of the reset time. It only tells you to log in when
-  Claude Code genuinely has no credentials stored.
+  are ("3h old") instead of the reset time. It only asks you to sign in when the
+  pet has no login of its own and your CLI's token isn't current either.
 - The window is only click-through where it's empty: the space the pet pops up
   into passes clicks to whatever is underneath, and the window starts taking
   clicks again once the cursor reaches the card or the pet.
@@ -48,7 +47,7 @@ colored dot appears in the macOS menu bar (grey idle, orange working, red needs
 approval). Drag the card or the pet to move them anywhere; the position is
 remembered. Click the pet to bring the Claude desktop app to the front,
 launching it if it isn't already running. Right-click the menu bar icon for
-Show/Hide, Reset Position, Start at Login, and Quit.
+Show/Hide, Reset Position, Sign In for Usage Limits, Start at Login, and Quit.
 
 This replaces the standalone `usage-hud` menu-bar app — quit that one, and turn
 off its login item, so you don't end up with two cards on screen.
@@ -60,28 +59,42 @@ done; otherwise see `hooks-snippet.json` in this repo.
 
 ## Usage limit rows
 
-These need no setup. The pet reads Claude Code's OAuth access token from the
-`Claude Code-credentials` keychain item and polls the usage endpoint directly.
+Sign in once: **Sign In for Usage Limits…** in the menu-bar menu opens Terminal
+on `claude auth login --claudeai`, pointed at a config directory only the pet
+uses (`~/Library/Application Support/claude-pet/claude-login`). Approve it in the
+browser and the rows fill in within a minute. That's the only setup, and it
+doesn't touch the login your terminal `claude` uses.
 
-**The pet never writes to the keychain, and never refreshes the token itself.**
-That matters more than it sounds. The server rotates the refresh token on every
-refresh, so whoever refreshes has to store the rotated value back — otherwise the
-*other* holder of that credential is silently logged out. An earlier version of
-this app refreshed without persisting, which logged the CLI out roughly every
-8 hours and had the card telling you to run `claude auth login` over and over.
+**Why the pet has its own login.** Every token refresh rotates the refresh token.
+A login shared by two programs is one lost response away from being dead for
+both: the rotated token never gets stored, the next refresh comes back
+`invalid_grant`, and Claude Code blanks its keychain entry. That's the "please
+log in" you then see. Earlier versions of the pet shared the CLI's login. First
+they refreshed it without saving the result. Later they ran `claude doctor`
+whenever its token lapsed, so Claude Code did the refresh. That was safer, but
+it still meant the pet was refreshing your login around the clock, and on
+2026-10-16 one of those refreshes is what blanked it, at a point when the pet was
+the only thing refreshing it.
 
-So renewal is delegated to the tool that owns the credential. When the stored
-token is within a minute of expiring, the pet runs `claude doctor` — a cheap
-authenticated command, well under a second, no inference and no MCP servers
-started — which makes Claude Code refresh and store the result the way it already
-knows how. The pet then reads back what the CLI wrote. `claude mcp list` is kept
-as a fallback in case `doctor` ever stops making an authenticated call. Renewals
-are serialised and rate-limited to one attempt per 5 minutes.
+With `CLAUDE_CONFIG_DIR` set, Claude Code stores a login under its own keychain
+entry, `Claude Code-credentials-<first 8 hex of sha256(dir)>`, so the pet's login
+is a separate grant that nothing else ever refreshes. When its token is within a
+minute of expiring, the pet runs `claude doctor` against that directory, a cheap
+authenticated command that makes Claude Code refresh and store the result the way
+it already knows how, then reads back what the CLI wrote. `claude mcp list` is
+kept as a fallback in case `doctor` ever stops making an authenticated call.
+Renewals are serialised and rate-limited to one attempt per 5 minutes. A 401 is
+never answered with a forced refresh: a token rejected before its expiry belongs
+to a revoked login, and refreshing it is what makes the CLI blank it.
 
-Two consequences worth knowing:
+The pet never writes to the keychain itself. Things worth knowing:
 
-- **Nothing to configure, and no re-login cycle.** It keeps working whether you
-  live in the terminal or the desktop app.
+- **Your CLI login is only ever read.** Until the pet is signed in, it borrows
+  the token in `Claude Code-credentials`, but only while it's current. It never
+  renews it, so once it lapses the rows go stale until you next use `claude` in a
+  terminal, or until you sign the pet in.
+- **If the pet's own login ever dies**, only the pet is affected. The card says
+  "sign in from the menu bar", and signing in again replaces it.
 - **The status-line file is still read, as a fallback.** Setups with no
   subscription token at all (Bedrock, Vertex, a plain API key) have no keychain
   entry to poll, so if `~/.claude/pet-limits.json` exists the pet will use it —

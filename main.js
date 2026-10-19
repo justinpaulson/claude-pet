@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 const https = require('https');
+const crypto = require('crypto');
 
 const PORT = 47823;
 // Sized for the card at its tallest (all four rows) plus the headroom the pet
@@ -28,20 +29,41 @@ const USAGE_POLL_MS = 5 * 60 * 1000;
 // doesn't get hammered every five minutes.
 const USAGE_BACKOFF_MS = 15 * 60 * 1000;
 const USAGE_API = 'https://api.anthropic.com/api/oauth/usage';
-const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 // Count a token as due for renewal slightly before it actually lapses, so a slow
 // request can't land on the far side of the expiry.
 const TOKEN_SKEW_MS = 60 * 1000;
-// The pet never refreshes the token itself and never writes to the keychain. The
-// server rotates the refresh token on every refresh, so whoever refreshes has to
-// persist the rotated value back or the *other* holder of that credential is
-// silently logged out — which is exactly what this app used to do to the CLI.
-// So renewal is handed to the tool that owns the credential: run a cheap
-// authenticated CLI command, let Claude Code refresh and store the result the
-// way it already knows how, then read back what it wrote. `doctor` is the light
-// one (under a second, no inference, no MCP servers started); `mcp list` is a
-// fallback in case `doctor` ever stops making an authenticated call.
+// The pet has a Claude login of its own, and never renews the one your terminal
+// `claude` uses. Every refresh rotates the refresh token, so a login shared by
+// two programs is one lost response away from being dead for both: when the
+// rotated token doesn't get stored, the next refresh comes back invalid_grant
+// and the CLI blanks its keychain entry, which is the "please log in" you then
+// see. The pet used to renew the CLI's login on its behalf (via `claude
+// doctor`), and on 2026-10-16 the blanking came out of one of those runs, at a
+// point when the pet was the only thing refreshing that login.
+//
+// So the pet signs in once, through the real CLI, into a config directory only
+// it uses. With CLAUDE_CONFIG_DIR set, Claude Code stores that login under its
+// own keychain entry, named after a hash of the directory, so it's an
+// independent grant that nothing else ever refreshes.
+const PET_CLAUDE_DIR = path.join(app.getPath('userData'), 'claude-login');
+const PET_KEYCHAIN_SERVICE = `Claude Code-credentials-${crypto
+  .createHash('sha256')
+  .update(PET_CLAUDE_DIR.normalize('NFC'))
+  .digest('hex')
+  .slice(0, 8)}`;
+// Your own CLI login. Read only, and only while its token is still current.
+// Renewing it is the CLI's job, never the pet's.
+const CLI_KEYCHAIN_SERVICE = 'Claude Code-credentials';
+// Renewal of the pet's own login is still done by Claude Code, so the CLI does
+// the refresh-and-store the way it already knows how. `doctor` is the light
+// command (under a second, no inference, no MCP servers started); `mcp list` is
+// a fallback in case `doctor` ever stops making an authenticated call.
 const CLAUDE_REFRESH_ARGS = [['doctor'], ['mcp', 'list']];
+// `open`ed in Terminal to run `claude auth login` against the pet's directory.
+const SIGN_IN_SCRIPT = path.join(app.getPath('userData'), 'sign-in.command');
+// With no usable login at all, looking again costs a keychain read and no
+// network, so it's done often enough to pick up a sign-in within the minute.
+const NO_LOGIN_RETRY_MS = 30 * 1000;
 // A GUI launch inherits almost no PATH, so the CLI is found by absolute path
 // first and only then left to PATH.
 const CLAUDE_BIN_CANDIDATES = [
@@ -140,13 +162,14 @@ function normalizeWindow(percent, resetsAt) {
 
 // Claude Code stores its OAuth credentials in the login keychain. The pet only
 // ever reads them, at the moment of use, and never logs them or writes them back.
-// `state` distinguishes a signed-out CLI (nothing stored) from the pet simply
-// being unable to read what is there — only the first is the user's to fix.
+// `state` distinguishes a signed-out login (nothing stored, or tokens blanked
+// after a dead refresh) from the pet simply being unable to read what is there —
+// only the first is the user's to fix.
 // The lookup is pinned to the user's account: other entries can share the
 // service name (e.g. one under account "unknown" holding only MCP OAuth tokens),
 // and an unpinned lookup returns whichever the keychain finds first.
-function readCredentials(cb) {
-  const args = ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', os.userInfo().username, '-w'];
+function readCredentials(service, cb) {
+  const args = ['find-generic-password', '-s', service, '-a', os.userInfo().username, '-w'];
   execFile('security', args, { timeout: 3000 }, (err, stdout, stderr) => {
     if (err) {
       // `security` exits 44 when the item isn't there at all.
@@ -184,12 +207,19 @@ function resolveClaudeBin() {
   return claudeBin;
 }
 
+// Every `claude` the pet starts works on the pet's own login, never yours.
+// USER is pinned too: Claude Code names the keychain account after it, and a
+// process started without one lands its login under account "unknown".
+function petClaudeEnv() {
+  return { ...process.env, USER: os.userInfo().username, CLAUDE_CONFIG_DIR: PET_CLAUDE_DIR };
+}
+
 // Guards against two renewals racing, and against retrying one that isn't going
 // to work.
 let refreshInFlight = null;
 let lastRefreshAt = 0;
 
-// Asks the CLI to renew its own credential, then reports whether a usable token
+// Asks the CLI to renew the pet's login, then reports whether a usable token
 // actually appeared. The command's exit status is ignored on purpose — the only
 // thing that matters is what ended up in the keychain afterwards.
 function refreshViaCli(cb) {
@@ -209,37 +239,47 @@ function refreshViaCli(cb) {
   // Run from the home directory so no project's settings or trust state is in play.
   const attempt = (i) => {
     if (i >= CLAUDE_REFRESH_ARGS.length) return settle(new Error("the CLI didn't renew the token"));
-    execFile(bin, CLAUDE_REFRESH_ARGS[i], { timeout: 90000, cwd: os.homedir() }, () => {
-      readCredentials((blob) => (usableToken(blob) ? settle(null) : attempt(i + 1)));
+    const opts = { timeout: 90000, cwd: os.homedir(), env: petClaudeEnv() };
+    execFile(bin, CLAUDE_REFRESH_ARGS[i], opts, () => {
+      readCredentials(PET_KEYCHAIN_SERVICE, (blob) => (usableToken(blob) ? settle(null) : attempt(i + 1)));
     });
   };
   attempt(0);
 }
 
-function withAccessToken(forceRefresh, cb) {
-  readCredentials((blob, state) => {
+// Whether the pet's own login exists, for the menu. Updated on every poll.
+let petSignedIn = false;
+
+// The pet's own login first, renewed when it lapses. Failing that, your CLI's
+// token, but only while it's current: the pet never renews it, so once it
+// lapses the pet waits for the CLI to renew it the next time you use it.
+function withAccessToken(cb) {
+  readCredentials(PET_KEYCHAIN_SERVICE, (blob, state) => {
+    setPetSignedIn(state !== 'missing');
     const token = usableToken(blob);
-    if (token && !forceRefresh) return cb(null, token);
-    if (state === 'missing') {
-      // Nothing stored: a signed-out CLI, or a setup that never had a
-      // subscription token at all (Bedrock, Vertex, a plain API key).
-      const err = new Error('no Claude Code credentials in the keychain');
-      err.signedOut = true;
-      return cb(err);
-    }
+    if (token) return cb(null, token);
+    if (state === 'missing') return borrowCliToken(cb);
     refreshViaCli((refreshErr) => {
-      if (refreshErr) {
-        // A token we already hold beats failing outright, even when the 401 that
-        // sent us here says it probably won't work.
-        if (token) return cb(null, token);
-        return cb(refreshErr);
-      }
-      readCredentials((renewed) => {
+      if (refreshErr) return borrowCliToken(cb, refreshErr);
+      readCredentials(PET_KEYCHAIN_SERVICE, (renewed) => {
         const fresh = usableToken(renewed);
         if (fresh) return cb(null, fresh);
-        cb(new Error('no usable token after the CLI renewed it'));
+        borrowCliToken(cb, new Error('no usable token after the CLI renewed it'));
       });
     });
+  });
+}
+
+// `petErr` is why the pet's own login couldn't be used. With none, the pet
+// simply isn't signed in, and saying so on the card is the useful thing.
+function borrowCliToken(cb, petErr) {
+  readCredentials(CLI_KEYCHAIN_SERVICE, (blob) => {
+    const token = usableToken(blob);
+    if (token) return cb(null, token);
+    if (petErr) return cb(petErr);
+    const err = new Error('pet not signed in and the CLI token is not current');
+    err.needsSignIn = true;
+    cb(err);
   });
 }
 
@@ -303,12 +343,13 @@ let claudeUsage = loadUsageCache();
 // why instead.
 const USAGE_MAX_AGE_MS = 60 * 60 * 1000;
 
-// Why the last poll didn't land, phrased for a 200px-wide card. Signed-out is
-// tracked apart from every other failure because it is the only one the user can
-// do anything about — and telling them to log in when they aren't logged out is
-// how this card spent a day crying wolf.
+// Why the last poll didn't land, phrased for a 200px-wide card. Needing a
+// sign-in is tracked apart from every other failure because it is the only one
+// the user can do anything about — and telling them to log in when they aren't
+// logged out is how this card spent a day crying wolf.
+const SIGN_IN_NOTE = 'sign in from the menu bar';
 let usageNote = null;
-let usageSignedOut = false;
+let usageNeedsSignIn = false;
 
 // "12m old" / "3h old" / "2d old" — an age the card has room for.
 function ageNote(ms) {
@@ -329,9 +370,9 @@ function currentClaudeUsage() {
     session: claudeUsage.session,
     weekly: claudeUsage.weekly,
     stale,
-    // Being signed out is worth naming; anything else, the honest thing to show
-    // is how old the numbers on screen actually are.
-    note: stale ? (usageSignedOut ? 'run claude auth login' : ageNote(age)) : null,
+    // Needing a sign-in is worth naming; anything else, the honest thing to
+    // show is how old the numbers on screen actually are.
+    note: stale ? (usageNeedsSignIn ? SIGN_IN_NOTE : ageNote(age)) : null,
   };
 }
 
@@ -356,17 +397,17 @@ function statusLineLimits() {
 
 function pollClaudeUsage() {
   const reschedule = (ms) => setTimeout(pollClaudeUsage, ms);
-  const failed = (reason, signedOut) => {
+  const failed = (reason, needsSignIn) => {
     // Only fall back to the status-line file while we've never had a good poll;
     // once the API has answered, its numbers are strictly fresher.
     if (!claudeUsage) {
       const fromFile = statusLineLimits();
       if (fromFile) claudeUsage = fromFile;
     }
-    usageSignedOut = Boolean(signedOut);
-    usageNote = signedOut ? 'run claude auth login' : null;
+    usageNeedsSignIn = Boolean(needsSignIn);
+    usageNote = needsSignIn ? SIGN_IN_NOTE : null;
     console.error(`[pet] usage poll failed: ${reason}`);
-    reschedule(USAGE_BACKOFF_MS);
+    reschedule(needsSignIn ? NO_LOGIN_RETRY_MS : USAGE_BACKOFF_MS);
   };
 
   const succeeded = (data) => {
@@ -375,25 +416,49 @@ function pollClaudeUsage() {
     if (!session && !weekly) return failed('no subscription windows in response');
     claudeUsage = { session, weekly, fetchedAt: Date.now() };
     usageNote = null;
-    usageSignedOut = false;
+    usageNeedsSignIn = false;
     saveUsageCache(claudeUsage);
     reschedule(USAGE_POLL_MS);
   };
 
-  // A 401 on a token we believed was current means it was revoked or rotated out
-  // from under us, so force one refresh and try again before giving up.
-  const attempt = (forceRefresh) => {
-    withAccessToken(forceRefresh, (tokenErr, token) => {
-      if (tokenErr) return failed(tokenErr.message, tokenErr.signedOut);
-      fetchUsage(token, (err, data) => {
-        if (err && err.statusCode === 401 && !forceRefresh) return attempt(true);
-        if (err) return failed(err.message);
-        succeeded(data);
-      });
+  // No forced refresh on a 401. A token rejected before its expiry belongs to a
+  // revoked login, and pushing that login through a refresh is what makes the
+  // CLI blank it. Nothing a refresh does here would bring it back.
+  withAccessToken((tokenErr, token) => {
+    if (tokenErr) return failed(tokenErr.message, tokenErr.needsSignIn);
+    fetchUsage(token, (err, data) => {
+      if (err) return failed(err.message);
+      succeeded(data);
     });
-  };
+  });
+}
 
-  attempt(false);
+// Signs the pet in to its own login, in Terminal rather than as a hidden child
+// process. The CLI may need to show a URL or ask for a pasted code, and a
+// window the user can see is the only place that works every time. The poll
+// loop notices the new login within NO_LOGIN_RETRY_MS.
+function startSignIn() {
+  const quote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const script = `#!/bin/zsh
+# Written by Claude Pet. Signs the pet in to a Claude login of its own, kept
+# apart from the one your terminal \`claude\` uses.
+export USER=${quote(os.userInfo().username)}
+export CLAUDE_CONFIG_DIR=${quote(PET_CLAUDE_DIR)}
+${quote(resolveClaudeBin())} auth login --claudeai
+echo
+echo 'Claude Pet will pick this up within a minute. You can close this window.'
+`;
+  try {
+    fs.mkdirSync(PET_CLAUDE_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(SIGN_IN_SCRIPT, script, { mode: 0o700 });
+    fs.chmodSync(SIGN_IN_SCRIPT, 0o700);
+  } catch (err) {
+    console.error(`[pet] could not write the sign-in script: ${err.message}`);
+    return;
+  }
+  execFile('open', [SIGN_IN_SCRIPT], (err) => {
+    if (err) console.error(`[pet] could not open the sign-in script: ${err.message}`);
+  });
 }
 
 function sampleUsage() {
@@ -725,9 +790,16 @@ function setStartAtLogin(on) {
   }
 }
 
-function createTray() {
-  tray = new Tray(TRAY_ICONS.idle);
-  const menu = Menu.buildFromTemplate([
+// Rebuilt whenever the sign-in item's label would change, since a built menu's
+// labels are fixed.
+function setPetSignedIn(signedIn) {
+  if (signedIn === petSignedIn) return;
+  petSignedIn = signedIn;
+  if (tray) tray.setContextMenu(buildTrayMenu());
+}
+
+function buildTrayMenu() {
+  return Menu.buildFromTemplate([
     {
       label: 'Show/Hide Pet',
       click: () => {
@@ -745,6 +817,10 @@ function createTray() {
     },
     { type: 'separator' },
     {
+      label: petSignedIn ? 'Usage Limits: Signed In (Sign In Again…)' : 'Sign In for Usage Limits…',
+      click: startSignIn,
+    },
+    {
       label: 'Start at Login',
       type: 'checkbox',
       checked: fs.existsSync(LOGIN_PLIST),
@@ -753,7 +829,11 @@ function createTray() {
     { type: 'separator' },
     { label: 'Quit Claude Pet', click: () => app.quit() },
   ]);
-  tray.setContextMenu(menu);
+}
+
+function createTray() {
+  tray = new Tray(TRAY_ICONS.idle);
+  tray.setContextMenu(buildTrayMenu());
   updateTray();
 }
 
